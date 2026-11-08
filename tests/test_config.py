@@ -92,7 +92,8 @@ def test_node_name_generated_once_and_persisted(tmp_path, raw):
     path = tmp_path / "config.local.json"
     path.write_text(json.dumps({"admin_key":"KEEPKEY", **raw}), encoding="utf-8")
     first = load_settings(path)
-    assert first.node_name.startswith("node-")
+    assert len(first.node_name) == 8
+    assert all(char in "0123456789abcdef" for char in first.node_name)
     assert first.peers == []
     assert first.admin_key == "KEEPKEY"
     assert load_settings(path).node_name == first.node_name
@@ -115,7 +116,7 @@ def test_peers_schema_and_unsupported_network_fail_clearly(tmp_path):
     raw = settings_from_raw({"peers":["http://127.0.0.1:8001/", "http://127.0.0.1:8001"]})
     assert raw.peers == ["http://127.0.0.1:8001"]
     assert settings_from_raw({"peers": ["1.1.1.1", "http://1.1.1.1:8000", "::1"]}).peers == [
-        "http://1.1.1.1:8000", "http://[::1]:8000",
+        "1.1.1.1", "http://1.1.1.1:8000", "::1",
     ]
     for peers in (None, "http://host", [42], ["file:///tmp"], ["http://user:pass@host"], ["http://host:0"]):
         with pytest.raises(ConfigError):

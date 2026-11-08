@@ -1,6 +1,7 @@
 """HTTP 与 WebSocket 接口。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import re
@@ -16,13 +17,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.config import ConfigError, SESSION_VERSION, VERSION
+from app.peer_address import peer_source
 from app.core.block import BlockError
 from app.core.state import RuleError
 from app.core.transaction import TxError
 from app.runtime import ClassroomError, ClassroomService
 
 STATIC_DIR = Path(__file__).parent / "static"
-LOOPBACK = {"127.0.0.1", "::1"}
+LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 
 
 def is_local_wallet_host(request: Request) -> bool:
@@ -85,6 +87,7 @@ class SettingsBody(BaseModel):
 
 
 def create_app(service: ClassroomService) -> FastAPI:
+    peer_lock = asyncio.Lock()
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
@@ -299,7 +302,20 @@ def create_app(service: ClassroomService) -> FastAPI:
                          token: str = Depends(student_token)) -> dict[str, Any]:
         local_owner(request, token)
         try:
-            return service.connect_peer(body.address)
+            async with peer_lock:
+                return service.connect_peer(body.address)
+        except ConfigError as exc:
+            raise ClassroomError(str(exc)) from exc
+
+    @app.post("/api/local/peers/{action}")
+    async def local_peer_action(request: Request, action: str, body: PeerBody,
+                                token: str = Depends(student_token)) -> dict[str, Any]:
+        local_owner(request, token)
+        if action not in {"disconnect", "delete"}:
+            raise HTTPException(status_code=404)
+        try:
+            async with peer_lock:
+                return await service.disconnect_peer(body.address, delete=action == "delete")
         except ConfigError as exc:
             raise ClassroomError(str(exc)) from exc
 
@@ -411,11 +427,15 @@ def create_app(service: ClassroomService) -> FastAPI:
             await socket.close(code=1008)
             return
         await socket.accept()
+        client = socket.client
+        host = client.host if client else "未知地址"
+        endpoint = peer_source(host, client.port) if client else host
         try:
-            await service.peers.exchange(socket.send_text, socket.receive_text)
+            await service.peers.exchange(socket.send_text, socket.receive_text, endpoint, direction="inbound")
         except WebSocketDisconnect:
             return
-        except (ValueError, TypeError, KeyError, TimeoutError):
+        except (ValueError, TypeError, KeyError, TimeoutError, asyncio.TimeoutError) as exc:
+            service.peers.log(f"关闭接入节点连接：{type(exc).__name__}")
             await socket.close(code=1008)
         else:
             await socket.close()
@@ -439,7 +459,8 @@ def create_app(service: ClassroomService) -> FastAPI:
                 except ValueError:
                     pass
                 identity = {"kind": "browser", "nickname": player["nickname"],
-                            "address": player["address"], "source_origin": origin}
+                            "address": player["address"], "source_origin": origin,
+                            "source_ip": peer_source(socket.client.host, 0).rsplit(":", 1)[0].strip("[]") if socket.client else ""}
         except ClassroomError:
             role = "guest"
         await service.hub.register(socket, identity)

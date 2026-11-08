@@ -4,7 +4,7 @@
 (function () {
   "use strict";
 
-  const { API, Feed, canonicalJson, formatCoins, parseCoins, formatHashrate, formatTime, formatCountdown, auctionPrice, escapeHtml, shortAddress, notify } = window.Sim;
+  const { setText, setHtml, deferWhileSelected, API, Feed, canonicalJson, formatCoins, parseCoins, formatHashrate, formatTime, formatCountdown, auctionPrice, escapeHtml, shortAddress, notify } = window.Sim;
 
   const STORAGE_PRIVATE_KEY = "btc-sim.private-key";
   const STORAGE_NICKNAME = "btc-sim.nickname";
@@ -51,6 +51,73 @@
 
   const api = new API();
   const feed = new Feed(handleEvent, handleConnection);
+  let sessionRecovery = null;
+  let pageRecovery = null;
+  let consoleEntered = false;
+  let jobPollGeneration = 0;
+  let pollTimer = null;
+  let meTimer = null;
+  api.recoverSession = recoverSession;
+
+  async function recoverSession(rejectedToken) {
+    if (rejectedToken && state.token && rejectedToken !== state.token) return;
+    if (sessionRecovery) return sessionRecovery;
+    sessionRecovery = (async () => {
+      const nickname = state.nickname || localStorage.getItem(STORAGE_NICKNAME);
+      if (!state.localWallet && (!nickname || !state.privateKey)) throw new Error("请先输入昵称进入课堂");
+      const result = state.localWallet ? await localPost("/api/local/wallet") : await login(nickname);
+      state.token = api.token = result.token;
+      state.nickname = result.player.nickname;
+      state.me = result.player;
+      if (!state.localWallet) {
+        localStorage.setItem(STORAGE_TOKEN, result.token);
+        localStorage.setItem(STORAGE_NICKNAME, state.nickname);
+      }
+      if (consoleEntered) {
+        setText($("me-nickname"), state.nickname);
+        feed.connect(state.token);
+      }
+    })();
+    try { await sessionRecovery; }
+    finally { sessionRecovery = null; }
+  }
+
+  async function recoverPage() {
+    if (document.hidden || pageRecovery) return pageRecovery;
+    pageRecovery = (async () => {
+      if (!consoleEntered) {
+        if (localStorage.getItem(STORAGE_TOKEN)) await restoreSession();
+        return;
+      }
+      try {
+        const result = await api.get("/api/me");
+        state.me = result;
+        feed.connect(state.token);
+        const previousDomain = state.transactionDomain;
+        await loadPublic();
+        if (!state.localWallet && previousDomain && previousDomain !== state.transactionDomain && state.mining) stopMining();
+        if (!state.localWallet && state.mining) {
+          disposeWorker();
+          state.workerJobKey = "";
+          state.workerJobId = "";
+          try { ensureWorker(); }
+          catch (problem) {
+            state.mining = false;
+            rememberBrowserMining(false);
+            updateMineButton();
+            throw problem;
+          }
+        }
+        await refreshMe();
+        await pollJob();
+      } catch (problem) {
+        pushLog(`恢复连接失败：${problem.message}，联网后将重试`, "error");
+        notify("暂未恢复连接，请检查网络后重试", "error");
+      }
+    })();
+    try { await pageRecovery; }
+    finally { pageRecovery = null; }
+  }
 
   async function localPost(path, body) {
     const response = await fetch(path, {
@@ -75,7 +142,7 @@
     state.privateKey = privateKey;
     state.publicKey = SimCrypto.publicKeyFromPrivate(privateKey);
     state.address = SimCrypto.addressFromPublicKey(state.publicKey);
-    $("login-address").textContent = shortAddress(state.address);
+    setText($("login-address"), shortAddress(state.address));
     $("wallet-address").value = state.address;
   }
 
@@ -99,6 +166,10 @@
     const nickname = $("login-nickname").value.trim();
     const error = $("login-error");
     error.hidden = true;
+    const button = event.currentTarget.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    setText(button, "进入中…");
     try {
       const result = await login(nickname);
       state.token = result.token;
@@ -106,10 +177,14 @@
       api.token = result.token;
       localStorage.setItem(STORAGE_NICKNAME, state.nickname);
       localStorage.setItem(STORAGE_TOKEN, result.token);
-      enterConsole(result.player);
+      await enterConsole(result.player);
     } catch (problem) {
-      error.textContent = problem.message;
+      setText(error, problem.message);
       error.hidden = false;
+      $("login-overlay").hidden = false;
+    } finally {
+      button.disabled = false;
+      setText(button, "进入");
     }
   }
 
@@ -128,34 +203,40 @@
       return false;
     }
     api.token = token;
+    state.token = token;
+    state.nickname = nickname;
     try {
       const me = await api.get("/api/me");
-      state.token = token;
-      state.nickname = nickname;
-      enterConsole(me);
+      state.token = api.token;
+      state.nickname = me.nickname;
+      await enterConsole(me);
       return true;
     } catch (problem) {
-      rememberBrowserMining(false);
-      localStorage.removeItem(STORAGE_TOKEN);
-      api.token = "";
+      $("login-nickname").value = nickname;
+      setText($("login-error"), `暂未恢复登录：${problem.message}。可以点击进入重试。`);
+      $("login-error").hidden = false;
       return false;
     }
   }
 
   async function enterConsole(player) {
+    consoleEntered = true;
     $("login-overlay").hidden = true;
     $("identity").hidden = false;
     $("topbar-wallet").hidden = false;
     $("logout").hidden = false;
-    $("me-nickname").textContent = state.nickname;
+    setText($("me-nickname"), state.nickname);
+    $("me-nickname").title = state.nickname;
     state.me = player;
     renderWallet();
     feed.connect(state.token);
     await loadPublic();
     loadRecentBlocks();
     pollJob();
-    setInterval(pollJob, JOB_POLL_MS);
-    setInterval(refreshMe, 10000);
+    clearInterval(pollTimer);
+    clearInterval(meTimer);
+    pollTimer = setInterval(pollJob, JOB_POLL_MS);
+    meTimer = setInterval(refreshMe, 10000);
     if (state.localWallet) {
       $("peer-form").hidden = false;
       $("wallet-backup-form").hidden = true;
@@ -171,11 +252,15 @@
 
   function handleConnection(online) {
     $("connection").classList.toggle("is-online", online);
-    $("connection-text").textContent = online ? "已连接课堂网络" : "连接断开，正在重连";
+    setText($("connection-text"), online ? "已连接课堂网络" : "连接断开，正在重连");
+    if (!state.localWallet && state.tick) renderNodes();
   }
 
   function handleEvent(event) {
     const data = event.data || {};
+    if (event.type === "hello" && data.role === "guest" && state.token) {
+      recoverSession(state.token).catch(problem => pushLog(`恢复登录失败：${problem.message}`, "error"));
+    }
     if (event.type === "hello" || event.type === "tick") {
       state.tick = data;
       renderLive();
@@ -186,7 +271,7 @@
       refreshMe();
       pollJob();
       if (data.reorganized) {
-        pushLog("主链发生重组，余额、藏品和待确认交易已重新计算", "info");
+        pushLog("主链发生重组，余额、藏品和待确认交易已重新计算", "reorg");
         notify("主链已重组，请查看更新后的余额和交易确认", "info");
       }
     } else if (event.type === "mining_job_changed") {
@@ -259,6 +344,9 @@
 
   function handleWorkerError(event) {
     event.preventDefault();
+    disposeWorker();
+    state.workerJobKey = "";
+    state.workerJobId = "";
     state.mining = false;
     rememberBrowserMining(false);
     state.rate = 0;
@@ -315,13 +403,20 @@
   }
 
   function startMining() {
+    try { ensureWorker(); }
+    catch (problem) {
+      state.mining = false;
+      updateMineButton();
+      pushLog(`无法启动矿工：${problem.message}`, "error");
+      notify(`无法启动矿工：${problem.message}`, "error");
+      return;
+    }
     state.mining = true;
 
     state.workerJobKey = "";
     state.workerJobId = "";
     state.workerShareBits = 0;
     updateMineButton();
-    ensureWorker();
     rememberBrowserMining(true);
     pushLog("开始挖矿，正在向服务器要作业…");
     pollJob();
@@ -340,12 +435,12 @@
     pushLog("已暂停挖矿");
   }
 
-  function rememberBrowserMining(running) {
+  function rememberBrowserMining(running, suspended = false) {
     if (state.localWallet) return;
     try {
       if (running && state.address && state.transactionDomain) {
         sessionStorage.setItem(STORAGE_MINING_INTENT, JSON.stringify({
-          address: state.address, domain: state.transactionDomain,
+          address: state.address, domain: state.transactionDomain, suspended,
         }));
       } else sessionStorage.removeItem(STORAGE_MINING_INTENT);
     } catch { /* Storage restrictions leave manual mining available. */ }
@@ -356,7 +451,7 @@
     try {
       const saved = JSON.parse(sessionStorage.getItem(STORAGE_MINING_INTENT) || "null");
       const navigation = performance.getEntriesByType("navigation")[0];
-      if (navigation?.type === "reload" && saved?.address === state.address
+      if ((navigation?.type === "reload" || saved?.suspended) && saved?.address === state.address
           && state.transactionDomain && saved.domain === state.transactionDomain) {
         startMining();
         pushLog("刷新后已恢复挖矿");
@@ -370,7 +465,7 @@
   }
 
   function updateMineButton() {
-    $("mine-toggle-label").textContent = state.mining ? "暂停挖矿" : "开始挖矿";
+    setText($("mine-toggle-label"), state.mining ? "暂停挖矿" : "开始挖矿");
     $("mine-toggle").classList.toggle("is-running", state.mining);
     $("mine-toggle").querySelector("use").setAttribute("href", state.mining ? "#i-pause" : "#i-play");
   }
@@ -379,8 +474,10 @@
     if (!state.token) {
       return;
     }
+    const generation = ++jobPollGeneration;
     try {
-      adoptJob(await api.post("/api/mining/job"));
+      const job = await api.post("/api/mining/job");
+      if (generation === jobPollGeneration) adoptJob(job);
     } catch (problem) {
       pushLog(`获取作业失败：${problem.message}`, "error");
     }
@@ -468,6 +565,12 @@
     }
     try {
       state.me = await api.get("/api/me");
+      if (state.nickname !== state.me.nickname) {
+        state.nickname = state.me.nickname;
+        setText($("me-nickname"), state.nickname);
+        $("me-nickname").title = state.nickname;
+        if (!state.localWallet) localStorage.setItem(STORAGE_NICKNAME, state.nickname);
+      }
       if (state.localWallet) {
         const miner = await localPost("/api/local/wallet/status");
         state.mining = miner.running;
@@ -479,9 +582,7 @@
       renderPackets();
       renderMiningStats();
     } catch (problem) {
-      if (String(problem.message).includes("登录")) {
-        logout();
-      }
+      pushLog(`刷新钱包失败：${problem.message}`, "error");
     }
   }
 
@@ -523,7 +624,7 @@
     try {
       const data = await api.get("/api/public");
       state.transactionDomain = data.transaction_domain;
-      $("classroom-name").textContent = data.classroom;
+      setText($("classroom-name"), data.classroom);
       renderAnnouncement(data.announcement);
     } catch (problem) {
       pushLog(`读取课堂信息失败：${problem.message}`, "error");
@@ -767,9 +868,9 @@
     const {count, bytes} = state.tick.mempool;
     const size = bytes < 1024 ? `${bytes} B` : bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} KiB`
       : bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MiB` : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-    $("chain-summary").textContent = `区块高度 ${chain.height} · 基准出块难度 ${chain.difficulty} 位 · 下一块奖励 ${formatCoins(chain.subsidy)} 币 · 内存池 ${count} 笔 / ${size}`;
-    $("stat-mempool").textContent = `${count} 笔`;
-    $("stat-mempool-bytes").textContent = size;
+    setText($("chain-summary"), `区块高度 ${chain.height} · 基准出块难度 ${chain.difficulty} 位 · 下一块奖励 ${formatCoins(chain.subsidy)} 币 · 内存池 ${count} 笔 / ${size}`);
+    setText($("stat-mempool"), `${count} 笔`);
+    setText($("stat-mempool-bytes"), size);
     $("stat-mempool").parentElement.title = `内存池 ${count} 笔 / ${bytes.toLocaleString()} B`;
     fitMiningStats();
     renderAnnouncement(state.tick.announcement);
@@ -788,41 +889,41 @@
       return;
     }
     box.hidden = false;
-    box.textContent = `老师通知：${announcement.message}`;
+    setText(box, `老师通知：${announcement.message}`);
   }
 
   function renderJob() {
     if (!state.job) {
-      $("job-line").textContent = "正在获取挖矿作业…";
+      setText($("job-line"), "正在获取挖矿作业…");
       return;
     }
     const job = state.job;
     const chain = state.tick?.chain;
     const relaxed = chain && job.height === chain.height + 1 && job.difficulty < chain.difficulty;
-    $("job-line").textContent =
-      `当前作业：第 ${job.height} 块 · 出块前导 ${job.difficulty} 位${relaxed ? `（等待较久，按规则从 ${chain.difficulty} 位临时放宽）` : ""} · 奖励 ${chain ? formatCoins(chain.subsidy) : "--"} 币 + 手续费`;
-    $("stat-share-bits").textContent = `${job.difficulty} 位`;
+    setText($("job-line"),
+      `当前作业：第 ${job.height} 块 · 出块前导 ${job.difficulty} 位${relaxed ? `（等待较久，按规则从 ${chain.difficulty} 位临时放宽）` : ""} · 奖励 ${chain ? formatCoins(chain.subsidy) : "--"} 币 + 手续费`);
+    setText($("stat-share-bits"), `${job.difficulty} 位`);
   }
 
   function renderMiningStats() {
     const mining = state.me ? state.me.mining : null;
-    $("stat-hashrate").textContent = formatHashrate(state.localWallet ? mining?.hashrate : state.rate);
+    setText($("stat-hashrate"), formatHashrate(state.localWallet ? mining?.hashrate : state.rate));
     const work = mining ? mining.stage_work : 0;
-    $("stat-work").textContent = compactWork(work);
+    setText($("stat-work"), compactWork(work));
     $("stat-work").title = work.toLocaleString();
-    $("stat-shares").textContent = mining ? mining.shares : 0;
-    $("stat-share-bits").textContent = state.job ? `${state.job.difficulty} 位` : "--";
-    $("stat-blocks").textContent = mining ? mining.blocks_found : 0;
+    setText($("stat-shares"), mining ? mining.shares : 0);
+    setText($("stat-share-bits"), state.job ? `${state.job.difficulty} 位` : "--");
+    setText($("stat-blocks"), mining ? mining.blocks_found : 0);
     const browserRow = $("browser-miner-row");
     const browserWorking = state.mining && !state.localWallet;
     browserRow.classList.toggle("is-working", browserWorking);
     browserRow.classList.toggle("is-idle", !browserWorking);
-    $("browser-miner-status").textContent = browserWorking ? "工作中" : "未工作";
+    setText($("browser-miner-status"), browserWorking ? "工作中" : "未工作");
     $("native-miner-row").hidden = !state.localWallet;
     $("native-miner-row").classList.toggle("is-working", state.localWallet && state.mining);
     $("native-miner-row").classList.toggle("is-idle", !state.mining);
-    $("native-miner-name").textContent = state.localMinerName;
-    $("native-miner-status").textContent = state.mining ? "工作中" : "未工作";
+    setText($("native-miner-name"), state.localMinerName);
+    setText($("native-miner-status"), state.mining ? "工作中" : "未工作");
     if (window.SimMiningDriver) window.SimMiningDriver.render();
     $("reset-miner").hidden = true;
     fitMiningStats();
@@ -841,20 +942,21 @@
     if (!state.me) {
       return;
     }
-    $("wallet-balance").textContent = formatCoins(state.me.balance);
-    $("wallet-mined").textContent = formatCoins(state.me.mined);
+    setText($("wallet-balance"), formatCoins(state.me.balance));
+    setText($("wallet-mined"), formatCoins(state.me.mined));
     $("wallet-address").value = state.me.address;
     const rows = state.me.transactions.map((tx) => {
       const outgoing = tx.sender === state.me.address;
       const kind = tx.type === "transfer" ? (outgoing ? "转出" : "转入") : labelOfType(tx.type);
-      const text = tx.amount ? `${kind} ${formatCoins(tx.amount)} 币` : kind;
+      const text = tx.type === "coinbase" ? `${formatCoins(tx.amount || 0)} 币`
+        : tx.amount ? `${kind} ${formatCoins(tx.amount)} 币` : kind;
       return `<li class="row-item">
         <span class="tag">${escapeHtml(labelOfType(tx.type))}</span>
         <span class="grow">${escapeHtml(text)}</span>
-        <span class="muted small">区块 #${tx.block_height} · ${tx.confirmations} 次确认 · ${formatTime(tx.timestamp)}</span>
+        <span class="muted small">区块 #${tx.block_height} · <span title="确认数 = 当前主链高度 − 所在区块高度 + 1；与节点数量无关">${tx.confirmations} 次确认</span> · ${formatTime(tx.timestamp)}</span>
       </li>`;
     });
-    $("tx-list").innerHTML = rows.join("") || `<li class="empty">还没有链上交易</li>`;
+    setHtml($("tx-list"), rows.join("") || `<li class="empty">还没有链上交易</li>`);
   }
 
   function renderPackets() {
@@ -883,7 +985,7 @@
         ${action}
       </li>`;
     });
-    $("packet-list").innerHTML = rows.join("") || `<li class="empty">当前没有可抢的红包，挖到币的同学可以发一个</li>`;
+    setHtml($("packet-list"), rows.join("") || `<li class="empty">当前没有可抢的红包，挖到币的同学可以发一个</li>`);
   }
 
   let renderedNftList = "";
@@ -915,6 +1017,7 @@
   }
 
   function renderNfts() {
+    if (deferWhileSelected($("nft-list"), renderNfts)) return;
     if (!state.tick) {
       return;
     }
@@ -992,6 +1095,7 @@
   }
 
   function renderAuctions() {
+    if (deferWhileSelected($("auction-list"), renderAuctions)) return;
     if (!state.tick) {
       return;
     }
@@ -1044,8 +1148,8 @@
       }
     }
     const timer = node.querySelector(".auction-timer");
-    timer.textContent = auction.ends_height ? `第 ${auction.ends_height} 块结算 · 剩余 ${auction.blocks_left} 块` :
-      (auction.seconds_left > 0 ? `剩余 ${formatCountdown(auction.seconds_left)}` : "已结束，等待结算");
+    setText(timer, auction.ends_height ? `第 ${auction.ends_height} 块结算 · 剩余 ${auction.blocks_left} 块` :
+      (auction.seconds_left > 0 ? `剩余 ${formatCountdown(auction.seconds_left)}` : "已结束，等待结算"));
   }
 
   function auctionRowHtml(auction) {
@@ -1095,7 +1199,7 @@
     const key = state.leaderboardTab === "hashrate" ? "by_hashrate" : "by_mined";
     const rows = state.tick.leaderboard[key];
     const body = $("leaderboard").querySelector("tbody");
-    body.innerHTML = rows
+    setHtml(body, rows
       .map((row, index) => {
         const me = row.address === state.address ? ' class="is-me"' : "";
         const place = index + 1;
@@ -1109,42 +1213,96 @@
           <td>${row.online ? '<span class="online">在线</span>' : '<span class="muted">离线</span>'}</td>
         </tr>`;
       })
-      .join("") || `<tr><td colspan="6" class="empty">还没有同学加入</td></tr>`;
+      .join("") || `<tr><td colspan="6" class="empty">还没有同学加入</td></tr>`);
   }
 
   function renderBlocks() {
     const rows = state.blocks.map(
-      (block) => `<li class="row-item">
+      (block) => `<li class="row-item block-row">
+        <time class="muted mono">${formatTime(block.timestamp)}</time>
         <span class="tag">#${block.height}</span>
-        <span class="grow mono">${String(block.hash).slice(0, 18)}…</span>
-        <span class="muted small">难度 ${block.difficulty} · ${formatTime(block.timestamp)}</span>
+        <button type="button" class="contract-copy block-hash" data-copy-block="${escapeHtml(block.hash)}" title="${escapeHtml(block.hash)}">${escapeHtml(block.hash)}</button>
+        <span class="muted block-difficulty">难度 ${block.difficulty}</span>
       </li>`,
     );
-    $("block-list").innerHTML = rows.join("") || `<li class="empty">链上还没有区块</li>`;
+    setHtml($("block-list"), rows.join("") || `<li class="empty">链上还没有区块</li>`);
     $("load-more-blocks").hidden = !state.blocks.length || state.blocks.at(-1).height === 0;
   }
 
   function renderNodes() {
     const nodes = state.tick?.nodes;
     const browsers = nodes?.browsers || [];
-    $("node-status").textContent = `独立节点连接 ${nodes?.connected ?? 0} 个 · 本节点连接的浏览器钱包 ${browsers.length} 个 · 区块高度 ${state.tick?.chain.height ?? "--"}`;
-    const ownBrowser = !state.localWallet && state.address;
-    const participants = [...browsers];
-    if (ownBrowser && !participants.some(row => row.address === state.address)) {
-      participants.unshift({address: state.address, nickname: state.nickname, source_origins: [location.origin]});
+    $("peer-form").hidden = !state.localWallet;
+    $("web-participants-title").hidden = !state.localWallet;
+    if (!state.localWallet) {
+      $("configured-peers").hidden = true;
+      $("node-log").hidden = true;
+      setText($("node-status"), `当前网页连接的节点 · 区块高度 ${state.tick?.chain.height ?? "--"}`);
+      setHtml($("node-participants"), `<li class="row-item provider-participant"><div class="participant-main"><strong>${escapeHtml(nodes?.node_name || "未命名")}</strong><span class="mono">${escapeHtml(location.host)}</span></div><div class="participant-details"><span>主动</span><span>${$("connection").classList.contains("is-online") ? "已连接" : "连接中"}</span><span>来源网页</span></div></li>`);
+      return;
     }
-    $("node-participants").innerHTML = `<li class="row-item node-participant"><strong>提供网页与 JS 的独立节点${nodes?.node_name ? `：${escapeHtml(nodes.node_name)}` : ""}</strong><span class="mono">${escapeHtml(location.origin)}</span></li>`
-      + participants.map(row => `<li class="row-item node-participant"><strong>浏览器端${row.address === ownBrowser ? "（本页）" : ""}：${escapeHtml(row.nickname || shortAddress(row.address))}</strong>
-          <span class="mono" title="${escapeHtml(row.address)}">${escapeHtml(shortAddress(row.address))}</span>
-          <span class="muted small">网页与 JS 来源：${escapeHtml((row.source_origins?.length ? row.source_origins : [row.address === ownBrowser ? location.origin : "当前节点（访问地址未上报）"]).join("、"))}</span></li>`).join("");
+    $("configured-peers").hidden = false;
+    $("node-log").hidden = false;
+    setText($("node-status"), `独立节点连接 ${nodes?.connected ?? 0} 个 · 本节点连接的浏览器钱包 ${browsers.length} 个 · 区块高度 ${state.tick?.chain.height ?? "--"}`);
+    setHtml($("node-participants"), browsers.map(row => `<li class="row-item browser-participant">
+      <strong title="${escapeHtml(row.address)}">${escapeHtml(row.nickname || shortAddress(row.address))}</strong>
+      <span class="mono">${escapeHtml(row.source_ips?.join("、") || "地址未上报")}</span>
+      <span>被动</span><span>已连接</span><span>来源网页</span></li>`).join("") || '<li class="empty">暂无网页参与者</li>');
     if (!nodes) return;
-    $("node-log").innerHTML = [...nodes.events].reverse().map(item =>
-      `<li><time class="muted small">${formatTime(item.at)}</time><span>${escapeHtml(item.message)}</span></li>`).join("") || '<li>暂时没有节点连接记录</li>';
+    renderConfiguredPeers(nodes.peers || []);
+    setHtml($("node-log"), [...nodes.events].reverse().map(item =>
+      `<li><time class="muted small">${formatTime(item.at)}</time><span>${escapeHtml(item.message)}</span></li>`).join("") || '<li>暂时没有节点连接记录</li>');
+  }
+
+  function renderConfiguredPeers(peers) {
+    const list = $("configured-peers");
+    if (deferWhileSelected(list, () => renderConfiguredPeers(peers))) return;
+    if (!peers.length) {
+      setHtml(list, '<li class="empty">尚未添加独立节点</li>');
+      return;
+    }
+    list.querySelector(".empty")?.remove();
+    const existing = new Map([...list.children].map(row => [row.dataset.peerKey, row]));
+    const peerStates = {connecting: "正在连接", connected: "已连接", retrying: "等待重试", paused: "已断开 · 不再重试"};
+    peers.forEach((peer, index) => {
+      const key = `${peer.direction || "outbound"}|${peer.address}`;
+      let row = existing.get(key);
+      existing.delete(key);
+      if (!row) {
+        row = document.createElement("li");
+        row.className = "row-item configured-peer";
+        row.dataset.peerKey = key;
+        row.innerHTML = '<strong class="peer-name"></strong><span class="peer-address mono"></span><span class="peer-direction muted small"></span><span class="peer-status muted small"></span><div class="peer-actions"></div>';
+      }
+      const inbound = peer.direction === "inbound";
+      const address = String(peer.address).replace(/^\[::ffff:(\d+\.\d+\.\d+\.\d+)\]:(\d+)$/i, "$1:$2");
+      setText(row.querySelector(".peer-name"), peer.name || "未命名");
+      row.querySelector(".peer-name").title = peer.name || "未命名";
+      setText(row.querySelector(".peer-address"), address);
+      row.querySelector(".peer-address").title = address;
+      setText(row.querySelector(".peer-direction"), inbound ? "被动" : "主动");
+      setText(row.querySelector(".peer-status"), `${peerStates[peer.status] || "未连接"}${inbound ? "（来源地址）" : ""}`);
+      row.querySelector(".peer-status").title = inbound ? "对方发起本次连接的源 IP 和临时端口，不是对方的服务监听端口" : "连接的节点服务地址";
+      const actions = row.querySelector(".peer-actions");
+      const controllable = state.localWallet && !inbound;
+      if (controllable && !actions.children.length) {
+        actions.innerHTML = '<button type="button" class="ghost"></button><button type="button" class="ghost" data-peer-action="delete">删除</button>';
+      }
+      actions.hidden = !controllable;
+      if (controllable) {
+        const button = actions.firstElementChild;
+        button.dataset.peerAction = peer.status === "paused" ? "connect" : "disconnect";
+        setText(button, peer.status === "paused" ? "连接" : "断开");
+        for (const action of actions.children) action.dataset.address = peer.address;
+      }
+      if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+    });
+    for (const row of existing.values()) row.remove();
   }
 
   function updatePhotoButton() {
     const selected = $("mint-photo").files.length > 0;
-    $("photo-toggle").textContent = selected ? "−" : "+";
+    setText($("photo-toggle"), selected ? "−" : "+");
     $("photo-toggle").title = selected ? "删除照片" : "上传照片";
     $("photo-toggle").setAttribute("aria-label", $("photo-toggle").title);
   }
@@ -1168,18 +1326,18 @@
   }
 
   function pushLog(message, kind) {
-    const category = kind === "error" ? "提示" : kind === "block" || message.startsWith("区块") ? "出块"
+    const category = kind === "reorg" ? "重组" : kind === "error" ? "提示" : kind === "block" || message.startsWith("区块") ? "出块"
       : message.includes("交易") ? "交易" : message.includes("作业") ? "作业" : "算力";
     state.log.unshift({ message, category, kind: kind || "info", at: new Date() });
     state.log = state.log.slice(0, LOG_LIMIT);
-    $("share-log").innerHTML = state.log
+    setHtml($("share-log"), state.log
       .map(
         (item) => `<li class="log-${item.kind}">
           <time class="muted small">${item.at.toLocaleTimeString("zh-CN", { hour12: false })}</time>
           <span class="log-category">${item.category}</span><span class="log-message">${escapeHtml(item.message)}</span>
         </li>`,
       )
-      .join("");
+      .join(""));
   }
 
   function nicknameOf(address) {
@@ -1223,11 +1381,20 @@
   }
 
   function bindEvents() {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) rememberBrowserMining(state.mining, true);
+      else recoverPage();
+    });
+    document.addEventListener("resume", recoverPage);
+    window.addEventListener("pageshow", event => { if (event.persisted) recoverPage(); });
+    window.addEventListener("online", recoverPage);
     new ResizeObserver(fitMiningStats).observe(document.querySelector(".panel-mining .stats"));
     document.fonts.ready.then(fitMiningStats);
     $("load-more-blocks").addEventListener("click", () => loadRecentBlocks(true));
     $("close-image").addEventListener("click", () => $("image-viewer").close());
     document.addEventListener("click", async event => {
+      const block = event.target.closest("[data-copy-block]");
+      if (block) await copyText(block.dataset.copyBlock, "区块哈希复制成功");
       const contract = event.target.closest("[data-copy-contract]");
       if (contract) await copyText(contract.dataset.copyContract, "合约地址复制成功");
       const picture = event.target.closest("[data-image]");
@@ -1248,7 +1415,7 @@
       $("full-image").src = url;
       $("download-image").href = url;
       $("download-image").download = `collectible.${extension}`;
-      $("image-caption").textContent = original ? "原图" : "此节点没有原图，显示链上缩略图";
+      setText($("image-caption"), original ? "原图" : "此节点没有原图，显示链上缩略图");
       if (!dialog.open) dialog.showModal();
     });
     $("photo-toggle").addEventListener("click", () => {
@@ -1265,6 +1432,20 @@
         notify("已添加节点，正在尝试连接", "info");
       } catch (problem) {
         notify(problem.message, "error");
+      }
+    });
+    $("configured-peers").addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-peer-action]");
+      if (!button || button.disabled) return;
+      button.disabled = true;
+      const action = button.dataset.peerAction;
+      try {
+        await localPost(action === "connect" ? "/api/local/peers" : `/api/local/peers/${action}`, {address: button.dataset.address});
+        notify(action === "delete" ? "已删除节点" : action === "disconnect" ? "已断开，停止自动重试；地址已保留" : "正在尝试连接", "info");
+      } catch (problem) {
+        notify(problem.message, "error");
+      } finally {
+        button.disabled = false;
       }
     });
     $("login-wallet-import").addEventListener("click", () => $("login-wallet-file").click());
@@ -1339,7 +1520,11 @@
         notify(problem.message, "error");
       }
     });
-    $("copy-address").addEventListener("click", copyAddress);
+    $("wallet-address").addEventListener("click", copyAddress);
+    $("wallet-address").addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); copyAddress(); }
+    });
+    $("identity").addEventListener("click", () => copyText(state.nickname, "名称复制成功"));
     $("load-miner").addEventListener("click", () => $("miner-file").click());
     $("miner-file").addEventListener("change", handleMinerFile);
     $("reset-miner").addEventListener("click", resetMiner);
@@ -1437,8 +1622,14 @@
         return;
       }
     }
-    loadWallet();
-    restoreSession();
+    try {
+      loadWallet();
+      await restoreSession();
+    } catch (problem) {
+      setText($("login-error"), `页面初始化失败：${problem.message}`);
+      $("login-error").hidden = false;
+      $("login-overlay").hidden = false;
+    }
   }
 
   boot();

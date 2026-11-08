@@ -1,7 +1,6 @@
 """本地节点配置、场次信息与证书路径。"""
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import secrets
@@ -9,12 +8,12 @@ import ssl
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from app.peer_address import peer_url
 
 from app.units import SAT_PER_COIN
 from app.core.consensus import Session
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 SESSION_VERSION = VERSION
 
 
@@ -84,6 +83,7 @@ class Settings:
     classroom_name: str = "区块链科普课堂"
     node_name: str = ""
     peers: list[str] = field(default_factory=list)
+    paused_peers: list[str] = field(default_factory=list)
     web_host: str = "0.0.0.0"
     web_port: int = 8000
     storage_path: str = "./data/classroom.db"
@@ -199,26 +199,18 @@ def settings_from_raw(raw: dict[str, Any]) -> Settings:
     normalized_peers = []
     for peer in peers:
         peer = peer.strip().rstrip("/")
-        if "://" not in peer:
-            try:
-                ip = ipaddress.ip_address(peer)
-            except ValueError as exc:
-                raise ConfigError("节点地址须为 IP 或 HTTP/HTTPS URL") from exc
-            host_literal = f"[{ip}]" if ip.version == 6 else str(ip)
-            peer = f"http://{host_literal}:8000"
         try:
-            parsed = urlsplit(peer)
-            port_number = parsed.port
+            peer_url(peer)
         except ValueError as exc:
-            raise ConfigError("peers 中的节点地址不合法") from exc
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-            or parsed.path not in {"", "/"}
-            or parsed.username is not None or parsed.password is not None
-            or parsed.query or parsed.fragment or (port_number is not None and port_number < 1)):
-            raise ConfigError("peers 中的节点地址必须是无凭据的 HTTP/HTTPS 地址")
+            raise ConfigError("节点地址须为 IP、IP:端口或无凭据的 HTTP/HTTPS 地址") from exc
         if peer not in normalized_peers:
             normalized_peers.append(peer)
     tls = raw.get("tls", {})
+    paused = raw.get("paused_peers", [])
+    if not isinstance(paused, list) or not all(isinstance(peer, str) for peer in paused):
+        raise ConfigError("paused_peers 必须是节点地址字符串列表")
+    if any(peer not in normalized_peers for peer in paused):
+        raise ConfigError("paused_peers 中的地址必须来自 peers 列表")
     if not isinstance(tls, dict) or not isinstance(tls.get("certificate_dir", ""), str):
         raise ConfigError("tls.certificate_dir 必须是字符串")
     reset = raw.get("reset_chain_on_start", True)
@@ -228,6 +220,7 @@ def settings_from_raw(raw: dict[str, Any]) -> Settings:
         classroom_name=name,
         node_name=node_name.strip(),
         peers=normalized_peers,
+        paused_peers=list(dict.fromkeys(paused)),
         web_host=host,
         web_port=port,
         storage_path=storage_path,
@@ -260,7 +253,7 @@ def load_settings(path: str | Path) -> Settings:
     """读取本地配置并在需要时保存自动生成的节点名称。"""
     config_path = Path(path)
     if not config_path.exists():
-        settings = Settings(node_name="node-" + secrets.token_hex(4))
+        settings = Settings(node_name=secrets.token_hex(4))
         save_settings(settings, config_path)
         return settings
 
@@ -270,7 +263,7 @@ def load_settings(path: str | Path) -> Settings:
         raise ConfigError(f"配置文件不是合法 JSON：{exc}") from exc
     settings = settings_from_raw(raw)
     if not settings.node_name or (settings.session() and ("admin_key" in raw or "chain" in raw)):
-        settings = replace(settings, node_name=settings.node_name or "node-" + secrets.token_hex(4))
+        settings = replace(settings, node_name=settings.node_name or secrets.token_hex(4))
         save_settings(settings, config_path)
     return settings
 
